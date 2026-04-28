@@ -68,6 +68,11 @@ struct FirecrawlClient {
     }
 }
 
+struct FirecrawlToolConfiguration {
+    let apiKey: String
+    let limit: Int
+}
+
 private struct FirecrawlSearchRequest: Encodable {
     struct ScrapeOptions: Encodable {
         let formats: [String]

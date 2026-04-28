@@ -124,18 +124,22 @@ private final class ChatViewModel: ObservableObject {
         let userMessage = ChatMessage(role: .user, content: text, attachments: attachments)
         messages.append(userMessage)
         isSending = true
-        activityMessage = configurationStore.webSearchEnabled && SearchIntentDetector.shouldSearch(text)
-            ? "正在用 Firecrawl 搜索"
-            : "正在生成回复"
+        activityMessage = configurationStore.webSearchEnabled ? "正在等待模型决定是否联网" : "正在生成回复"
 
         Task {
             do {
-                let outboundMessages = try await messagesForRequest(
-                    visibleMessages: messages,
-                    query: text
-                )
+                let outboundMessages = messagesForRequest(visibleMessages: messages)
+                let firecrawlTool = configurationStore.webSearchEnabled
+                    ? FirecrawlToolConfiguration(
+                        apiKey: configurationStore.firecrawlAPIKey,
+                        limit: configurationStore.firecrawlResultLimit
+                    )
+                    : nil
                 activityMessage = "正在生成回复"
-                let reply = try await LLMClient(configuration: configuration).send(messages: outboundMessages)
+                let reply = try await LLMClient(configuration: configuration).send(
+                    messages: outboundMessages,
+                    firecrawlTool: firecrawlTool
+                )
                 messages.append(ChatMessage(role: .assistant, content: reply))
                 updateMemoryIfNeeded(
                     configuration: configuration,
@@ -179,7 +183,7 @@ private final class ChatViewModel: ObservableObject {
         errorMessage = nil
     }
 
-    private func messagesForRequest(visibleMessages: [ChatMessage], query: String) async throws -> [ChatMessage] {
+    private func messagesForRequest(visibleMessages: [ChatMessage]) -> [ChatMessage] {
         var outboundMessages = visibleMessages
         let systemPrompt = MemoryManager.buildSystemPrompt(
             basePrompt: configurationStore.baseSystemPrompt,
@@ -188,28 +192,6 @@ private final class ChatViewModel: ObservableObject {
         if !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             outboundMessages.insert(ChatMessage(role: .system, content: systemPrompt), at: 0)
         }
-
-        guard SearchIntentDetector.shouldSearch(query), configurationStore.webSearchEnabled else {
-            return outboundMessages
-        }
-
-        let searchContext = try await FirecrawlClient(
-            apiKey: configurationStore.firecrawlAPIKey,
-            limit: configurationStore.firecrawlResultLimit
-        ).searchContext(for: query)
-
-        guard let lastUserIndex = outboundMessages.lastIndex(where: { $0.role == .user }) else {
-            return outboundMessages
-        }
-
-        outboundMessages[lastUserIndex].content = """
-        用户问题：
-        \(query)
-
-        以下是 Firecrawl 网页搜索结果。请优先基于这些结果回答；如果搜索结果不足以支持结论，请明确说明。回答中用 Markdown 引用来源，格式如 [1]、[2]，并在末尾列出链接。
-
-        \(searchContext)
-        """
         return outboundMessages
     }
 
@@ -923,7 +905,7 @@ private struct SettingsView: View {
 
                         ResultLimitStepper(value: $store.firecrawlResultLimit)
                     } footer: {
-                        Text("开启后，仅当问题明显需要实时信息时才调用 Firecrawl /v2/search，例如包含“搜索、查一下、最新、今天、新闻、价格”等。")
+                        Text("开启后，Firecrawl 会作为模型工具注册；只有模型发起 tool call 时，客户端才调用 /v2/search。")
                             .font(.footnote)
                             .foregroundStyle(AppTheme.secondaryInk)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1171,10 +1153,10 @@ private struct WebSearchToggle: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("允许 Firecrawl 自动联网")
+                Text("允许模型调用 Firecrawl")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(AppTheme.ink)
-                Text(isOn ? "仅在实时信息意图明显时搜索" : "模型只使用自身上下文")
+                Text(isOn ? "按需 tool call，不预先搜索" : "模型只使用自身上下文")
                     .font(.caption)
                     .foregroundStyle(AppTheme.secondaryInk)
             }
@@ -1427,28 +1409,6 @@ private extension LLMProvider {
         case .anthropic:
             "/messages"
         }
-    }
-}
-
-private enum SearchIntentDetector {
-    private static let triggerTerms = [
-        "搜索", "联网", "查一下", "查找", "检索", "搜一下",
-        "最新", "今天", "昨日", "昨天", "当前", "现在", "实时",
-        "新闻", "价格", "股价", "汇率", "天气", "官网", "网页",
-        "资料", "source", "search", "web", "latest", "today", "news", "current"
-    ]
-
-    static func shouldSearch(_ query: String) -> Bool {
-        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else {
-            return false
-        }
-
-        if triggerTerms.contains(where: { normalized.contains($0.lowercased()) }) {
-            return true
-        }
-
-        return normalized.range(of: #"20\d{2}.*(发布|更新|版本|价格|新闻)"#, options: .regularExpression) != nil
     }
 }
 
