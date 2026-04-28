@@ -124,7 +124,9 @@ private final class ChatViewModel: ObservableObject {
         let userMessage = ChatMessage(role: .user, content: text, attachments: attachments)
         messages.append(userMessage)
         isSending = true
-        activityMessage = configurationStore.webSearchEnabled ? "正在用 Firecrawl 搜索" : "正在生成回复"
+        activityMessage = configurationStore.webSearchEnabled && SearchIntentDetector.shouldSearch(text)
+            ? "正在用 Firecrawl 搜索"
+            : "正在生成回复"
 
         Task {
             do {
@@ -187,7 +189,7 @@ private final class ChatViewModel: ObservableObject {
             outboundMessages.insert(ChatMessage(role: .system, content: systemPrompt), at: 0)
         }
 
-        guard configurationStore.webSearchEnabled, !query.isEmpty else {
+        guard SearchIntentDetector.shouldSearch(query), configurationStore.webSearchEnabled else {
             return outboundMessages
         }
 
@@ -849,6 +851,7 @@ private extension UIImage {
 
 private struct SettingsView: View {
     @StateObject private var store = ConfigurationStore.shared
+    @State private var modelTestState: ModelTestState = .idle
 
     var body: some View {
         VStack(spacing: 0) {
@@ -899,6 +902,10 @@ private struct SettingsView: View {
                         TokenStepper(value: $store.maxTokens)
                     }
 
+                    SettingsSection(title: "模型测试") {
+                        ModelTestPanel(store: store, state: $modelTestState)
+                    }
+
                     SettingsSection(title: "联网搜索") {
                         WebSearchToggle(isOn: $store.webSearchEnabled)
 
@@ -916,7 +923,7 @@ private struct SettingsView: View {
 
                         ResultLimitStepper(value: $store.firecrawlResultLimit)
                     } footer: {
-                        Text("开启后，发送前会调用 Firecrawl /v2/search 搜索网页并抓取 markdown，再把结果交给模型回答。")
+                        Text("开启后，仅当问题明显需要实时信息时才调用 Firecrawl /v2/search，例如包含“搜索、查一下、最新、今天、新闻、价格”等。")
                             .font(.footnote)
                             .foregroundStyle(AppTheme.secondaryInk)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1164,10 +1171,10 @@ private struct WebSearchToggle: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("使用 Firecrawl 联网")
+                Text("允许 Firecrawl 自动联网")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(AppTheme.ink)
-                Text(isOn ? "发送前搜索网页并注入上下文" : "模型只使用自身上下文")
+                Text(isOn ? "仅在实时信息意图明显时搜索" : "模型只使用自身上下文")
                     .font(.caption)
                     .foregroundStyle(AppTheme.secondaryInk)
             }
@@ -1178,6 +1185,102 @@ private struct WebSearchToggle: View {
                 .labelsHidden()
         }
         .padding(.vertical, 7)
+    }
+}
+
+private enum ModelTestState: Equatable {
+    case idle
+    case testing
+    case success(String)
+    case failure(String)
+
+    var message: String? {
+        switch self {
+        case .idle, .testing:
+            nil
+        case .success(let message), .failure(let message):
+            message
+        }
+    }
+}
+
+private struct ModelTestPanel: View {
+    @ObservedObject var store: ConfigurationStore
+    @Binding var state: ModelTestState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("测试当前模型")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(AppTheme.ink)
+                    Text("只发送一条轻量测试消息，不触发 Firecrawl 或记忆总结")
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.secondaryInk)
+                }
+
+                Spacer()
+
+                Button {
+                    testModel()
+                } label: {
+                    HStack(spacing: 6) {
+                        if state == .testing {
+                            ProgressView()
+                                .scaleEffect(0.75)
+                        } else {
+                            Image(systemName: "checkmark.seal")
+                        }
+                        Text(state == .testing ? "测试中" : "测试")
+                    }
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 9)
+                    .background(store.configuration.isReady ? AppTheme.ink : AppTheme.secondaryInk.opacity(0.35))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(state == .testing || !store.configuration.isReady)
+            }
+
+            if let message = state.message {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(isSuccess ? AppTheme.teal : .red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 7)
+    }
+
+    private var isSuccess: Bool {
+        if case .success = state {
+            return true
+        }
+        return false
+    }
+
+    private func testModel() {
+        let configuration = store.configuration
+        guard configuration.isReady else {
+            state = .failure("请先填写 API Key、地址前缀和模型。")
+            return
+        }
+
+        state = .testing
+        Task {
+            do {
+                let reply = try await LLMClient(configuration: configuration).send(messages: [
+                    ChatMessage(role: .system, content: "你正在进行连通性测试。请只用一句中文简短回复，不要调用任何工具。"),
+                    ChatMessage(role: .user, content: "请回复：模型连接正常。")
+                ])
+                state = .success("测试成功：\(reply)")
+            } catch {
+                state = .failure(error.localizedDescription)
+            }
+        }
     }
 }
 
@@ -1324,6 +1427,28 @@ private extension LLMProvider {
         case .anthropic:
             "/messages"
         }
+    }
+}
+
+private enum SearchIntentDetector {
+    private static let triggerTerms = [
+        "搜索", "联网", "查一下", "查找", "检索", "搜一下",
+        "最新", "今天", "昨日", "昨天", "当前", "现在", "实时",
+        "新闻", "价格", "股价", "汇率", "天气", "官网", "网页",
+        "资料", "source", "search", "web", "latest", "today", "news", "current"
+    ]
+
+    static func shouldSearch(_ query: String) -> Bool {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else {
+            return false
+        }
+
+        if triggerTerms.contains(where: { normalized.contains($0.lowercased()) }) {
+            return true
+        }
+
+        return normalized.range(of: #"20\d{2}.*(发布|更新|版本|价格|新闻)"#, options: .regularExpression) != nil
     }
 }
 
